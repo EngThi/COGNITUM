@@ -766,30 +766,48 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hc_replied = False
             if hc_key:
                 try:
-                    logger.info("Attempting HackClub AI (DeepSeek) fallback...")
                     import httpx as _httpx
                     hc_messages = [{"role": m["role"], "content": m["content"]} for m in messages if m.get("content")]
+                    hc_models = [
+                        "deepseek/deepseek-v4-flash:free",
+                        "meta-llama/llama-3.3-70b-instruct:free",
+                        "qwen/qwen3-coder:free"
+                    ]
+                    hc_reply = None
                     async with _httpx.AsyncClient() as hc_client:
-                        hc_resp = await hc_client.post(
-                            "https://ai.hackclub.com/proxy/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {hc_key}", "Content-Type": "application/json"},
-                            json={"model": "deepseek/deepseek-r1-0528:free", "messages": hc_messages},
-                            timeout=60.0
-                        )
-                        hc_resp.raise_for_status()
-                        hc_data = hc_resp.json()
-                        hc_reply = hc_data["choices"][0]["message"]["content"].strip()
-                    logger.info(f"HackClub AI returned {len(hc_reply)} chars. Sending to Telegram...")
-                    try:
-                        await update.message.reply_text(markdown_to_html(hc_reply), parse_mode="HTML")
-                        logger.info("Reply sent via HackClub AI (HTML mode).")
-                    except Exception as html_err:
-                        logger.warning(f"HTML send failed ({html_err}), trying plain text...")
-                        await update.message.reply_text(hc_reply)
-                        logger.info("Reply sent via HackClub AI (plain text mode).")
-                    hc_replied = True
+                        for model_name in hc_models:
+                            try:
+                                logger.info(f"Attempting HackClub AI fallback with model {model_name}...")
+                                hc_resp = await hc_client.post(
+                                    "https://ai.hackclub.com/proxy/v1/chat/completions",
+                                    headers={"Authorization": f"Bearer {hc_key}", "Content-Type": "application/json"},
+                                    json={"model": model_name, "messages": hc_messages},
+                                    timeout=60.0
+                                )
+                                if hc_resp.status_code == 200:
+                                    hc_data = hc_resp.json()
+                                    hc_reply = hc_data["choices"][0]["message"]["content"].strip()
+                                    logger.info(f"HackClub AI ({model_name}) returned {len(hc_reply)} chars.")
+                                    break
+                                else:
+                                    logger.warning(f"HackClub AI model {model_name} failed with status {hc_resp.status_code}: {hc_resp.text}")
+                            except Exception as model_err:
+                                logger.warning(f"HackClub AI model {model_name} error: {model_err}")
+                    
+                    if hc_reply:
+                        logger.info("Sending HackClub AI response to Telegram...")
+                        try:
+                            await update.message.reply_text(markdown_to_html(hc_reply), parse_mode="HTML")
+                            logger.info("Reply sent via HackClub AI (HTML mode).")
+                        except Exception as html_err:
+                            logger.warning(f"HTML send failed ({html_err}), trying plain text...")
+                            await update.message.reply_text(hc_reply)
+                            logger.info("Reply sent via HackClub AI (plain text mode).")
+                        hc_replied = True
+                    else:
+                        logger.error("All HackClub AI fallback models failed.")
                 except Exception as hc_err:
-                    logger.error(f"HackClub AI fallback failed: {hc_err}")
+                    logger.error(f"HackClub AI fallback processing error: {hc_err}")
             # --- Fallback 2: Gemini Direct ---
             if not hc_replied:
                 try:
