@@ -36,7 +36,7 @@ def clean_json_text(text: str) -> str:
         
     return text
 
-async def route_generation(contents, config=None, chat_id=None) -> Any:
+async def route_generation(contents, config=None, chat_id=None):
     """Helper that decides whether to route requests through KimiProxy or Gemini Direct."""
     proxy_active = await get_proxy_mode(chat_id)
     if proxy_active:
