@@ -437,16 +437,16 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent_active = await get_agent_mode(telegram_chat_id)
     proxy_active = await get_proxy_mode(telegram_chat_id)
 
+    # Load user context for ALL modes (used by fallback models too)
     system_prompt = ""
-    if agent_active:
-        try:
-            memory_dir = Path(settings.memory_dir)
-            user_md = (memory_dir / "USER.md").read_text(encoding="utf-8") if (memory_dir / "USER.md").exists() else ""
+    try:
+        memory_dir = Path(settings.memory_dir)
+        user_md = (memory_dir / "USER.md").read_text(encoding="utf-8") if (memory_dir / "USER.md").exists() else ""
+        if agent_active:
             system_md = (memory_dir / "SYSTEM.md").read_text(encoding="utf-8") if (memory_dir / "SYSTEM.md").exists() else ""
             rules_md = (memory_dir / "RULES.md").read_text(encoding="utf-8") if (memory_dir / "RULES.md").exists() else ""
             current_md = (memory_dir / "CURRENT.md").read_text(encoding="utf-8") if (memory_dir / "CURRENT.md").exists() else ""
             tools_md = (memory_dir / "TOOLS.md").read_text(encoding="utf-8") if (memory_dir / "TOOLS.md").exists() else ""
-            
             system_prompt = (
                 f"# ONBOARDING CONTEXT\n\n"
                 f"You are Thiago's CLI & automation agent for the COGNITUM OS.\n"
@@ -459,9 +459,16 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tools_md:
                 system_prompt += f"{tools_md}\n\n"
             system_prompt += "Be concise, efficient, and write Portuguese explanations by default."
-        except Exception as e:
-            logger.error(f"Failed to load operational memory: {e}")
-            system_prompt = "You are Thiago's CLI & automation agent for COGNITUM. Answer in Portuguese."
+        else:
+            # Non-agent mode: minimal context so AI knows who the user is
+            system_prompt = (
+                f"Você é o assistente pessoal de Thiago no COGNITUM OS. "
+                f"Responda sempre em português, de forma concisa e direta.\n\n"
+                f"{user_md}"
+            ).strip()
+    except Exception as e:
+        logger.error(f"Failed to load operational memory: {e}")
+        system_prompt = "Você é o assistente pessoal de Thiago. Responda sempre em português."
 
     messages = []
     if system_prompt:
@@ -612,16 +619,19 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = f"{kimi_url_base}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer your_secret_api_key"
+        "Authorization": f"Bearer {settings.kimi_proxy_api_key}"
     }
 
     current_kimi_chat_id = session["kimi_chat_id"] if session else None
     current_kimi_parent_id = session["last_parent_id"] if session else None
 
     for turn in range(max_turns):
+        # KimiProxy recebe APENAS a mensagem do usuário (sem system prompt)
+        # O contexto do Kimi é gerenciado pelo usuário no site oficial
+        kimi_messages = [m for m in messages if m.get("role") != "system"]
         data = {
             "model": "k2d6",
-            "messages": messages
+            "messages": kimi_messages
         }
         if current_kimi_chat_id:
             data["kimi_chat_id"] = current_kimi_chat_id
@@ -655,6 +665,9 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_out = choice["message"]
                 assistant_reply = message_out.get("content") or ""
                 tool_calls = message_out.get("tool_calls") or []
+
+                if turn == 0 and not assistant_reply and not tool_calls:
+                    raise Exception("KimiProxy returned an empty response")
 
                 messages.append(message_out)
 
@@ -747,21 +760,65 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_chat_action(chat_id=telegram_chat_id, action="typing")
 
         except Exception as e:
-            logger.error(f"Error calling KimiProxy: {e}. Falling back to Gemini Direct...")
-            try:
-                client = get_genai_client()
-                response = client.models.generate_content(
-                    model=settings.gemini_model,
-                    contents=user_text
-                )
-                gemini_reply = response.text.strip()
+            logger.error(f"Error calling KimiProxy: {e}. Falling back to HackClub AI (DeepSeek)...")
+            # --- Fallback 1: HackClub AI (DeepSeek) - OpenAI-compatible, passes full context ---
+            hc_key = os.environ.get("OPENROUTER_API_KEY", "")
+            hc_replied = False
+            if hc_key:
                 try:
-                    await update.message.reply_text(markdown_to_html(gemini_reply), parse_mode="HTML")
-                except Exception:
-                    await update.message.reply_text(gemini_reply)
-            except Exception as gemini_err:
-                logger.error(f"Fallback to Gemini also failed: {gemini_err}")
-                await update.message.reply_text("❌ Desculpe, nao consegui obter resposta no momento.")
+                    logger.info("Attempting HackClub AI (DeepSeek) fallback...")
+                    import httpx as _httpx
+                    hc_messages = [{"role": m["role"], "content": m["content"]} for m in messages if m.get("content")]
+                    async with _httpx.AsyncClient() as hc_client:
+                        hc_resp = await hc_client.post(
+                            "https://ai.hackclub.com/proxy/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {hc_key}", "Content-Type": "application/json"},
+                            json={"model": "deepseek/deepseek-r1-0528:free", "messages": hc_messages},
+                            timeout=60.0
+                        )
+                        hc_resp.raise_for_status()
+                        hc_data = hc_resp.json()
+                        hc_reply = hc_data["choices"][0]["message"]["content"].strip()
+                    logger.info(f"HackClub AI returned {len(hc_reply)} chars. Sending to Telegram...")
+                    try:
+                        await update.message.reply_text(markdown_to_html(hc_reply), parse_mode="HTML")
+                        logger.info("Reply sent via HackClub AI (HTML mode).")
+                    except Exception as html_err:
+                        logger.warning(f"HTML send failed ({html_err}), trying plain text...")
+                        await update.message.reply_text(hc_reply)
+                        logger.info("Reply sent via HackClub AI (plain text mode).")
+                    hc_replied = True
+                except Exception as hc_err:
+                    logger.error(f"HackClub AI fallback failed: {hc_err}")
+            # --- Fallback 2: Gemini Direct ---
+            if not hc_replied:
+                try:
+                    logger.info("Attempting Gemini Direct fallback...")
+                    # Build Gemini-compatible contents from messages
+                    gemini_contents = []
+                    for m in messages:
+                        if m.get("role") == "user" and m.get("content"):
+                            gemini_contents.append(m["content"])
+                    client = get_genai_client()
+                    response = client.models.generate_content(
+                        model=settings.gemini_model,
+                        contents="\n\n".join(gemini_contents) if gemini_contents else user_text
+                    )
+                    gemini_reply = response.text.strip()
+                    logger.info(f"Gemini Direct returned {len(gemini_reply)} chars. Sending to Telegram...")
+                    try:
+                        await update.message.reply_text(markdown_to_html(gemini_reply), parse_mode="HTML")
+                        logger.info("Reply sent via Gemini Direct (HTML mode).")
+                    except Exception as html_err:
+                        logger.warning(f"HTML send failed ({html_err}), trying plain text...")
+                        await update.message.reply_text(gemini_reply)
+                        logger.info("Reply sent via Gemini Direct (plain text mode).")
+                except Exception as gemini_err:
+                    logger.error(f"Fallback to Gemini also failed: {gemini_err}")
+                    try:
+                        await update.message.reply_text("❌ Desculpe, nao consegui obter resposta no momento.")
+                    except Exception as reply_err:
+                        logger.error(f"Even error message failed to send: {reply_err}")
             break
 
 async def handle_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

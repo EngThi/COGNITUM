@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     
     # Kimi Proxy configurations
     kimi_proxy_url: str = "http://localhost:3000"
+    kimi_proxy_api_key: str = "cognitum-internal-key"
 
     model_config = SettingsConfigDict(
         env_file=".env",
