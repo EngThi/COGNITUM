@@ -1,0 +1,21 @@
+allowed_commands:
+- ls
+- git status
+- git log
+- python3 --version
+- df -h
+- free -m
+denied_commands:
+- rm -rf /
+- rm -rf *
+- mkfs
+- dd if=
+- shutdown
+- reboot
+- passwd
+restricted_hours:
+  start: '22:30'
+  end: '06:10'
+safety_gate_enabled: true
+allow_sudo: false
+enforce_workspace_containment: true

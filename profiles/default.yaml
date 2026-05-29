@@ -1,0 +1,8 @@
+name: Thiago
+timezone: America/Sao_Paulo
+preferences:
+  explanations: Portuguese
+  verbosity: medium
+objectives:
+- Upgrade and stabilize COGNITUM layer
+- Integrate clean cognitive routines in HOMES ecosystem
