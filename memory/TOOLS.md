@@ -40,15 +40,18 @@ Run tools on stdio-based Model Context Protocol (MCP) servers. The bot automatic
 * **Tool Signature:** `call_mcp_tool(server_command: str, tool_name: str, arguments: dict) -> str`
 
 ### 🛠️ Common MCP Servers Available on the VPS
-* **Notion Integration:**
-  * **Command:** `npx -y @modelcontextprotocol/server-notion`
-  * **Description:** Access, edit, search, and manage your Notion workspace.
+* **Filesystem Access:**
+  * **Command:** `npx -y @modelcontextprotocol/server-filesystem <allowed-directories>`
+  * **Description:** Access, read, write, and list directories on the local filesystem.
 * **SQLite Database:**
-  * **Command:** `npx -y @modelcontextprotocol/server-sqlite`
-  * **Description:** Execute raw SQL queries, create tables, or read schema from local database files.
-* **HTTP Web Page Fetcher:**
-  * **Command:** `npx -y @modelcontextprotocol/server-fetch`
-  * **Description:** Cleanly download, parse, and convert any public HTML page into clean Markdown.
+  * **Command:** `uvx mcp-server-sqlite --db-path /opt/automation/runtime/state/automation.db`
+  * **Description:** Execute raw SQL queries, read schema, and manage database records.
+* **HTTP Web Page Fetcher (Fetch):**
+  * **Command:** `uvx mcp-server-fetch`
+  * **Description:** Fetch pages from the web and convert them to clean Markdown.
+* **Notion Integration:**
+  * **Command:** `uvx mcp-server-notion` or `npx -y notion-mcp-server`
+  * **Description:** Access, edit, search, and manage your Notion workspace.
 
 ---
 
