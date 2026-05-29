@@ -23,3 +23,7 @@ uvloop==0.22.1
 
 # Telegram Interface
 python-telegram-bot==22.7
+
+# Model Context Protocol
+mcp>=1.2.0
+
