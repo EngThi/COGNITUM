@@ -114,12 +114,11 @@ Format the response EXACTLY as a JSON object with this structure:
   }}
 }}
 """
-    response = await route_generation(
+    response = await generate_content_with_backoff(
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
-        ),
-        chat_id=chat_id
+        )
     )
     return json.loads(clean_json_text(response.text))
 
