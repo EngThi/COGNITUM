@@ -1,0 +1,1 @@
+# COGNITUM Gateways package

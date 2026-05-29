@@ -1,0 +1,206 @@
+import json
+import os
+import asyncio
+import time
+import re
+import httpx
+from google import genai
+from google.genai import types
+from google.genai.errors import ClientError
+from automations.state import save_event, get_unprocessed_events, mark_event_status, get_proxy_mode
+from automations.log import get_logger
+from automations.config import settings
+
+logger = get_logger("ai_router")
+
+_client = None
+
+def get_genai_client():
+    global _client
+    if _client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY not found in environment!")
+            raise ValueError("GEMINI_API_KEY missing")
+        _client = genai.Client(api_key=api_key)
+    return _client
+
+class KimiResponse:
+    def __init__(self, text: str):
+        self.text = text
+
+def clean_json_text(text: str) -> str:
+    text = text.strip()
+    pattern = r"^```(?:json)?\s*(.*?)\s*```$"
+    match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
+    if match:
+        text = match.group(1).strip()
+        
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    first_bracket = text.find('[')
+    last_bracket = text.rfind(']')
+    
+    if first_brace != -1 and last_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        return text[first_brace:last_brace+1]
+    elif first_bracket != -1 and last_bracket != -1:
+        return text[first_bracket:last_bracket+1]
+        
+    return text
+
+async def generate_with_backoff(contents, config=None, model='gemini-2.5-flash', chat_id=None):
+    proxy_active = await get_proxy_mode(chat_id)
+    if proxy_active:
+        logger.info(f"KimiProxy active. Attempting generation for chat_id={chat_id}...")
+        prompt = ""
+        if isinstance(contents, list):
+            prompt_parts = []
+            for item in contents:
+                if isinstance(item, str):
+                    prompt_parts.append(item)
+                elif hasattr(item, 'text'):
+                    prompt_parts.append(item.text)
+                else:
+                    prompt_parts.append(str(item))
+            prompt = "\n".join(prompt_parts)
+        elif isinstance(contents, str):
+            prompt = contents
+        else:
+            prompt = str(contents)
+
+        import os
+        kimi_url_base = os.environ.get("KIMI_PROXY_URL", "http://localhost:3000").rstrip("/")
+        url = f"{kimi_url_base}/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer your_secret_api_key"
+        }
+        data = {
+            "model": "k2d6",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        try:
+            from automations.state import record_kimi_use, ensure_kimiproxy_running
+            await record_kimi_use()
+            await ensure_kimiproxy_running()
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=data, headers=headers, timeout=120.0)
+                response.raise_for_status()
+                res_data = response.json()
+                content = res_data["choices"][0]["message"]["content"]
+                logger.info("Successfully generated content via KimiProxy.")
+                return KimiResponse(content)
+        except Exception as proxy_err:
+            logger.error(f"KimiProxy generation failed: {proxy_err}. Falling back to Gemini Direct...")
+
+    client = get_genai_client()
+    delay = 10
+    for i in range(5):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+            return response
+        except ClientError as e:
+            if getattr(e, 'code', None) == 429 or "429" in str(e):
+                logger.warning(f"Gemini API rate limit hit (429). Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                logger.warning(f"Rate limit exception. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise
+    raise RuntimeError("Max retries exceeded for Gemini API due to rate limits.")
+
+async def classify_unstructured_input(text: str, chat_id: int | None = None) -> dict:
+    prompt = f"""
+You are the AI Router of a Personal Cognitive Operating System.
+Your job is to classify the unstructured input and return a JSON object.
+
+Unstructured input:
+\"\"\"
+{text}
+\"\"\"
+
+Classify this input into one of these event types:
+- `note.idea`: Thoughts, raw ideas, brainstorming.
+- `note.mistake`: Mistakes, errors, bugs, or lessons learned.
+- `note.session`: Log of a study or active work session.
+- `task.created`: To-dos, tasks, or action items.
+- `note.concept`: Definitions, computer engineering concepts, academic topics.
+
+Format the response EXACTLY as a JSON object with this structure:
+{{
+  "type": "one of the types listed above",
+  "content": "the cleaned up content (in Markdown format if applicable, keeping all details)",
+  "metadata": {{
+    "title": "A short, descriptive title",
+    "tags": ["relevant", "tags"],
+    "context": "extra context extracted if any"
+  }}
+}}
+"""
+    response = await generate_with_backoff(
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json"
+        ),
+        chat_id=chat_id
+    )
+    return json.loads(clean_json_text(response.text))
+
+async def process_router_queue():
+    """Fetches all unprocessed events for 'ai_router' and classifies them."""
+    events = await get_unprocessed_events("ai_router")
+    for event in events:
+        event_id = event["id"]
+        event_type = event["type"]
+        
+        if event_type in ["raw.input", "telegram.message"]:
+            try:
+                payload = json.loads(event["payload"])
+                text = payload.get("text", "")
+                chat_id = payload.get("chat_id")
+                if not text:
+                    await mark_event_status(event_id, "ai_router", "processed")
+                    continue
+                
+                logger.info(f"Routing event ID {event_id} of type {event_type}...")
+                classification = await classify_unstructured_input(text, chat_id=chat_id)
+                
+                new_type = classification.get("type", "note.idea")
+                new_payload = {
+                    "content": classification.get("content", text),
+                    "metadata": classification.get("metadata", {}),
+                    "original_event_id": event_id,
+                    "chat_id": chat_id
+                }
+                await save_event(new_type, new_payload)
+                
+                await mark_event_status(event_id, "ai_router", "processed")
+                logger.info(f"Event ID {event_id} successfully routed to {new_type}")
+            except Exception as e:
+                logger.error(f"Failed to route event ID {event_id}: {e}")
+                await mark_event_status(event_id, "ai_router", "failed", str(e))
+        else:
+            await mark_event_status(event_id, "ai_router", "processed")
+
+if __name__ == "__main__":
+    async def test():
+        import sys
+        if len(sys.argv) > 1:
+            text = sys.argv[1]
+            res = await classify_unstructured_input(text)
+            print(json.dumps(res, indent=2))
+        else:
+            print("Please provide a text argument to classify.")
+    asyncio.run(test())

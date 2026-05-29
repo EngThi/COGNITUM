@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+*.db
+*.db-journal
+*.db-wal
+logs/
+tmp/
+__pycache__/
+*.pyc
+*.key
+*.pem
+oracle.key
