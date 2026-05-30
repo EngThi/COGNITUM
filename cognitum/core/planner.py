@@ -1,12 +1,11 @@
-import os
 import json
 import asyncio
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
-from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
 from cognitum.config import settings
+from cognitum.core.utils import get_genai_client
 
 class PlanStep(BaseModel):
     step_number: int = Field(..., description="1-indexed sequence number of this step")
@@ -19,17 +18,6 @@ class Plan(BaseModel):
     steps: List[PlanStep] = Field(..., description="Sequential steps to achieve the goal")
     reasoning: str = Field(..., description="Reasoning and explanation for the proposed plan")
     required_contexts: List[str] = Field(..., description="Information or files needed before executing the steps")
-
-_client = None
-
-def get_genai_client() -> genai.Client:
-    global _client
-    if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY") or settings.gemini_api_key
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY missing in environment / configuration settings")
-        _client = genai.Client(api_key=api_key)
-    return _client
 
 async def generate_content_with_backoff(
     contents: Any,
@@ -94,7 +82,7 @@ async def generate_plan(
     prompt += (
         "Generate a step-by-step action plan to achieve the goal. "
         "The plan must satisfy safety policies (e.g. no prohibited actions, restricted hours warnings if applicable). "
-        "Recommend specific tools where appropriate (e.g. read_file, run_command, call_mcp_tool)."
+        "Recommend specific tools where appropriate (e.g. read_file, run_command, filesystem__read_file, github__search_code)."
     )
 
     response = await generate_content_with_backoff(
