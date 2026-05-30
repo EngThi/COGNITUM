@@ -27,3 +27,6 @@ python-telegram-bot==22.7
 # Model Context Protocol
 mcp>=1.2.0
 composio-core>=0.7.0
+composio==0.13.1
+composio-openai-agents==0.13.1
+openai-agents==0.17.4
