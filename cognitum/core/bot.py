@@ -3,14 +3,11 @@ import json
 import html
 import re
 import subprocess
+import httpx
 from pathlib import Path
 from datetime import datetime
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
-from google.genai.errors import ClientError
-
 from cognitum.config import settings
 from cognitum.core.state import (
     save_event,
@@ -30,9 +27,9 @@ from cognitum.core.state import (
 from cognitum.core.log import get_logger
 from cognitum.core.tools.vault_tool import search_vault
 from cognitum.core.tools.status_tool import get_status
-from cognitum.core.tools.composio_tool import call_composio_action
-from cognitum.core.tools.mcp_tool import call_mcp_tool
+from cognitum.core.tools.composio_tool import call_composio_action_async
 from cognitum.core.tools.http_tool import call_http_api
+from cognitum.core.utils import get_genai_client, truncate
 
 logger = get_logger("telegram_bot")
 
@@ -144,17 +141,6 @@ def get_action_description(func_name, func_args):
         url = func_args.get("url", "")
         return f"Requisição HTTP <code>{method} {html.escape(url)}</code>"
     return f"Execução de {func_name}"
-
-_genai_client = None
-
-def get_genai_client():
-    global _genai_client
-    if _genai_client is None:
-        api_key = os.getenv("GEMINI_API_KEY") or settings.gemini_api_key
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment or config.")
-        _genai_client = genai.Client(api_key=api_key)
-    return _genai_client
 
 async def post_init(application) -> None:
     commands = [
@@ -477,144 +463,37 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tools = []
     if agent_active:
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_command",
-                    "description": "Execute a shell command (bash) on the host system. Use this to check system configuration, manage git, run scripts, etc.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string", "description": "The exact shell command to execute."}
-                        },
-                        "required": ["command"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read the contents of a text file from the filesystem.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "The absolute path to the file."}
-                        },
-                        "required": ["path"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "description": "Write or overwrite content to a file on the filesystem.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "The absolute path to write the file."},
-                            "content": {"type": "string", "description": "The full text content to write."}
-                        },
-                        "required": ["path", "content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_directory",
-                    "description": "List files and directories in a given path.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "The directory path to list."}
-                        },
-                        "required": ["path"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_vault",
-                    "description": "Search for a query string across markdown files in Obsidian vault.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "The search term to look for."}
-                        },
-                        "required": ["query"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_status",
-                    "description": "Get the health, queue sizes, and event logs.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "call_composio_action",
-                    "description": "Execute a Composio integration tool.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "action_name": {"type": "string", "description": "The action name."},
-                            "parameters": {"type": "object", "description": "Parameters for the action."}
-                        },
-                        "required": ["action_name", "parameters"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "call_mcp_tool",
-                    "description": "Run a tool on a Model Context Protocol (MCP) server.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "server_command": {"type": "string", "description": "MCP server command."},
-                            "tool_name": {"type": "string", "description": "Tool name."},
-                            "arguments": {"type": "object", "description": "Parameters."}
-                        },
-                        "required": ["server_command", "tool_name", "arguments"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "call_http_api",
-                    "description": "Make an HTTP request.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "method": {"type": "string", "description": "HTTP method."},
-                            "url": {"type": "string", "description": "URL."},
-                            "headers": {"type": "object", "description": "Headers.", "default": {}},
-                            "json_data": {"type": "object", "description": "JSON payload.", "default": {}}
-                        },
-                        "required": ["method", "url"]
-                    }
-                }
-            }
-        ]
+        from cognitum.core.tool_router import build_schema
+        tools = await build_schema()
+
+    async def _local_executor(tool_name: str, args: dict) -> str:
+        if tool_name == "run_command":
+            return tool_run_command(args.get("command", ""))
+        if tool_name == "read_file":
+            return tool_read_file(args.get("path", ""))
+        if tool_name == "write_file":
+            return tool_write_file(args.get("path", ""), args.get("content", ""))
+        if tool_name == "list_directory":
+            return tool_list_directory(args.get("path", ""))
+        if tool_name == "search_vault":
+            output = search_vault(args.get("query", ""))
+            return "\n".join(output) if isinstance(output, list) else str(output)
+        if tool_name == "get_status":
+            return get_status()
+        if tool_name == "call_composio_action":
+            return await call_composio_action_async(args.get("action_name", ""), args.get("parameters", {}))
+        if tool_name == "call_http_api":
+            return call_http_api(
+                args.get("method", "GET"),
+                args.get("url", ""),
+                args.get("headers"),
+                args.get("json_data"),
+            )
+        return f"Error: Tool {tool_name} not found."
+
 
     max_turns = 8
-    import urllib.request
-    import json
-    import os
-    
+
     kimi_url_base = os.environ.get("KIMI_PROXY_URL", settings.kimi_proxy_url).rstrip("/")
     url = f"{kimi_url_base}/v1/chat/completions"
     headers = {
@@ -646,10 +525,11 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await record_kimi_use()
             await ensure_kimiproxy_running()
             
-            req = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=120) as response:
-                res_data = json.loads(response.read().decode())
-                
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, headers=headers, json=data, timeout=120.0)
+                resp.raise_for_status()
+                res_data = resp.json()
+
                 new_kimi_chat_id = res_data.get("kimi_chat_id")
                 new_kimi_parent_id = res_data.get("kimi_parent_id")
                 if new_kimi_chat_id and new_kimi_parent_id:
@@ -695,43 +575,31 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML"
                     )
 
-                    if func_name == "run_command":
-                        cmd_output = tool_run_command(func_args.get("command", ""))
-                    elif func_name == "read_file":
-                        cmd_output = tool_read_file(func_args.get("path", ""))
-                    elif func_name == "write_file":
-                        cmd_output = tool_write_file(func_args.get("path", ""), func_args.get("content", ""))
-                    elif func_name == "list_directory":
-                        cmd_output = tool_list_directory(func_args.get("path", ""))
-                    elif func_name == "search_vault":
-                        cmd_output = search_vault(func_args.get("query", ""))
-                        cmd_output = "\n".join(cmd_output) if isinstance(cmd_output, list) else str(cmd_output)
-                    elif func_name == "get_status":
-                        cmd_output = get_status()
-                    elif func_name == "call_composio_action":
-                        cmd_output = call_composio_action(
-                            func_args.get("action_name", ""),
-                            func_args.get("parameters", {})
-                        )
-                    elif func_name == "call_mcp_tool":
-                        cmd_output = call_mcp_tool(
-                            func_args.get("server_command", ""),
-                            func_args.get("tool_name", ""),
-                            func_args.get("arguments", {})
-                        )
-                    elif func_name == "call_http_api":
-                        cmd_output = call_http_api(
-                            func_args.get("method", "GET"),
-                            func_args.get("url", ""),
-                            func_args.get("headers"),
-                            func_args.get("json_data")
-                        )
-                    else:
-                        cmd_output = f"Error: Tool {func_name} not found."
+                    from cognitum.core.policy_gate import check_action_safety
+                    from cognitum.core.tool_router import execute as router_execute
 
-                    trunc_output = cmd_output
-                    if len(trunc_output) > 2500:
-                        trunc_output = trunc_output[:2500] + "\n... [TRUNCATED] ..."
+                    if func_name in ("run_command", "write_file", "read_file"):
+                        is_safe, reason = check_action_safety(func_name, func_args)
+                        if not is_safe:
+                            cmd_output = f"⛔ Ação bloqueada pela PolicyGate: {reason}"
+                            try:
+                                await status_msg.edit_text(
+                                    f"⛔ <b>Bloqueado:</b> {action_desc}\n\n{html.escape(reason)}",
+                                    parse_mode="HTML"
+                                )
+                            except Exception:
+                                pass
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "name": func_name,
+                                "content": cmd_output
+                            })
+                            continue
+
+                    cmd_output = await router_execute(func_name, func_args, _local_executor)
+
+                    trunc_output = truncate(cmd_output, 2500)
                     
                     escaped_output = html.escape(trunc_output)
                     try:

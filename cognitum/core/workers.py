@@ -16,6 +16,7 @@ from cognitum.core.state import get_unprocessed_events, mark_event_status, save_
 from cognitum.core.log import get_logger
 from cognitum.core.planner import generate_content_with_backoff, get_genai_client
 from cognitum.core.policy_gate import load_policy, is_in_restricted_hours
+from cognitum.core.utils import clean_json_text
 
 logger = get_logger("workers")
 
@@ -24,25 +25,6 @@ def slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "_", text)
     return text.strip("_")
-
-def clean_json_text(text: str) -> str:
-    text = text.strip()
-    pattern = r"^```(?:json)?\s*(.*?)\s*```$"
-    match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
-    if match:
-        text = match.group(1).strip()
-        
-    first_brace = text.find('{')
-    last_brace = text.rfind('}')
-    first_bracket = text.find('[')
-    last_bracket = text.rfind(']')
-    
-    if first_brace != -1 and last_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
-        return text[first_brace:last_brace+1]
-    elif first_bracket != -1 and last_bracket != -1:
-        return text[first_bracket:last_bracket+1]
-        
-    return text
 
 async def run_note_worker():
     """Processes note events and writes Markdown files to the vault."""

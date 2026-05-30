@@ -84,27 +84,28 @@ def check_action_safety(action_type: str, parameters: Dict[str, Any]) -> Tuple[b
     if not policy.safety_gate_enabled:
         return True, "Safety gate is disabled."
 
+    # Command safety check. Hard-denied commands take precedence over contextual
+    # checks so callers/tests get a deterministic explanation for dangerous input.
+    if action_type == "run_command":
+        cmd = parameters.get("command", "").strip()
+        if not cmd:
+            return False, "Empty command string."
+
+        # Sudo check
+        if not policy.allow_sudo and ("sudo " in cmd or cmd.startswith("sudo")):
+            return False, "Action blocked: Sudo commands are prohibited by policy."
+
+        # Denied command/keywords check
+        for denied in policy.denied_commands:
+            if denied in cmd:
+                return False, f"Action blocked: Command contains forbidden keyword '{denied}'."
+
     # Time checks
     if is_in_restricted_hours(policy):
         # Allow reading, but restrict changes/execution during restricted hours
         if action_type in ["run_command", "write_file"]:
             return False, f"Action blocked: execution restricted during quiet hours ({policy.restricted_hours.get('start')} - {policy.restricted_hours.get('end')})."
 
-    # Command safety check
-    if action_type == "run_command":
-        cmd = parameters.get("command", "").strip()
-        if not cmd:
-            return False, "Empty command string."
-            
-        # Sudo check
-        if not policy.allow_sudo and ("sudo " in cmd or cmd.startswith("sudo")):
-            return False, "Action blocked: Sudo commands are prohibited by policy."
-            
-        # Denied command/keywords check
-        for denied in policy.denied_commands:
-            if denied in cmd:
-                return False, f"Action blocked: Command contains forbidden keyword '{denied}'."
-                
     # Path containment check (read/write safety)
     elif action_type in ["read_file", "write_file"]:
         path_str = parameters.get("path", "").strip()

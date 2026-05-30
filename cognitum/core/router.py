@@ -1,7 +1,6 @@
 import json
 import os
 import asyncio
-import re
 import httpx
 from google import genai
 from google.genai import types
@@ -10,31 +9,13 @@ from cognitum.config import settings
 from cognitum.core.state import save_event, get_unprocessed_events, mark_event_status, get_proxy_mode
 from cognitum.core.log import get_logger
 from cognitum.core.planner import generate_content_with_backoff, get_genai_client
+from cognitum.core.utils import clean_json_text
 
 logger = get_logger("ai_router")
 
 class KimiResponse:
     def __init__(self, text: str):
         self.text = text
-
-def clean_json_text(text: str) -> str:
-    text = text.strip()
-    pattern = r"^```(?:json)?\s*(.*?)\s*```$"
-    match = re.match(pattern, text, re.DOTALL | re.IGNORECASE)
-    if match:
-        text = match.group(1).strip()
-        
-    first_brace = text.find('{')
-    last_brace = text.rfind('}')
-    first_bracket = text.find('[')
-    last_bracket = text.rfind(']')
-    
-    if first_brace != -1 and last_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
-        return text[first_brace:last_brace+1]
-    elif first_bracket != -1 and last_bracket != -1:
-        return text[first_bracket:last_bracket+1]
-        
-    return text
 
 async def route_generation(contents, config=None, chat_id=None):
     """Helper that decides whether to route requests through KimiProxy or Gemini Direct."""

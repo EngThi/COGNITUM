@@ -1,5 +1,6 @@
 import uvloop
 import asyncio
+import signal
 import shutil
 import psutil
 import httpx
@@ -13,6 +14,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 from cognitum.config import settings
 from cognitum.core.state import init_db, save_event
+from cognitum.core.log import get_logger
 from cognitum.api.profile import router as profile_router
 from cognitum.api.policy import router as policy_router
 from cognitum.api.memory import router as memory_router
@@ -21,17 +23,72 @@ from cognitum.api.plan import router as plan_router
 
 # Lifespan manager for FastAPI (replaces deprecated on_event('startup')/'shutdown')
 http_client = None
+logger = get_logger("main")
+_mcp_signal_handlers_registered = False
+
+
+def _register_mcp_signal_handlers() -> None:
+    global _mcp_signal_handlers_registered
+    if _mcp_signal_handlers_registered:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def _shutdown_mcp() -> None:
+        from cognitum.core.mcp_client import shutdown_all
+
+        await shutdown_all()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous_handler = signal.getsignal(sig)
+
+        def _handler(signum, frame, *, previous=previous_handler) -> None:
+            try:
+                loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown_mcp()))
+            except RuntimeError:
+                pass
+
+            if callable(previous):
+                previous(signum, frame)
+            elif previous == signal.SIG_DFL:
+                if signum == signal.SIGINT:
+                    raise KeyboardInterrupt
+                raise SystemExit(0)
+
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, RuntimeError):
+            logger.warning(f"Could not register MCP shutdown handler for {sig.name}")
+
+    _mcp_signal_handlers_registered = True
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     # Startup actions
     await init_db()
+    try:
+        from cognitum.core.tool_router import MCP_SERVERS_DEFAULT, init_tool_router
+
+        await init_tool_router(MCP_SERVERS_DEFAULT)
+    except Exception as exc:
+        logger.warning(f"MCP ToolRouter initialization failed; continuing without MCP tools: {exc}")
+
+    _register_mcp_signal_handlers()
     http_client = httpx.AsyncClient(timeout=settings.http_timeout)
-    yield
-    # Shutdown actions
-    if http_client:
-        await http_client.aclose()
+    try:
+        yield
+    finally:
+        # Shutdown actions
+        try:
+            from cognitum.core.mcp_client import shutdown_all
+
+            await shutdown_all()
+        except Exception as exc:
+            logger.warning(f"MCP shutdown failed: {exc}")
+
+        if http_client:
+            await http_client.aclose()
 
 app = FastAPI(
     title="COGNITUM — Cognition Layer",
